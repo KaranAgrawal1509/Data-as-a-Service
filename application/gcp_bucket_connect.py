@@ -7,7 +7,9 @@ from google.oauth2 import service_account
 
 def get_sqlite_connection():
     # Authenticate the application with GCP
+    # json_file_path = "key.json"
     json_file_path = "/fastapi/key.json"
+
     credentials = service_account.Credentials.from_service_account_file(
         json_file_path, scopes=["https://www.googleapis.com/auth/cloud-platform"]
     )

@@ -1,14 +1,14 @@
 version: '3'
 services:
   streamlit:
-    image: streamlit_app:v1
+    image: streamlit_app_a3:v1
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - ALGORITHM=${ALGORITHM}
     ports:
       - "8080:8080"
   fastapi:
-    image: fast_api:v1
+    image: fast_api_a3:v1
     environment:
       - AWS_ACCESS_KEY=${AWS_ACCESS_KEY}
       - AWS_SECRET_KEY=${AWS_SECRET_KEY}
@@ -20,5 +20,6 @@ services:
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES}
     volumes:
       - ./application/key.json:/fastapi/key.json
+      - ./application/users.db:/fastapi/users.db
     ports:
       - "8000:8000"

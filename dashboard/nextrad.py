@@ -7,20 +7,34 @@ import logging
 import requests
 import streamlit as st
 
+# PREFIX = "http://localhost:8000"
 PREFIX = "http://fastapi:8000"
 
 
-def nextrad(access_token):
+def nextrad(access_token, user_id):
     headers = {"Authorization": f"Bearer {access_token}"}
 
+    def remaining_api_calls():
+        response = requests.get(f"{PREFIX}/remaining_api_calls", headers=headers).json()
+        remaining_calls = response["remaining_calls"]
+        return remaining_calls
+
+    with st.sidebar:
+        remaining_calls = remaining_api_calls()
+        st.write(
+            f'<p style="font-size: 24px; font-weight: bold;">Remaining API calls: {remaining_calls}</p>',
+            unsafe_allow_html=True,
+        )
+    #######################################################################################################################
+    ### AWS Variables
+    #######################################################################################################################
     src_bucket_name = "noaa-nexrad-level2"
     dest_bucket_name = "damg7245-noaa-assignment"
     #######################################################################################################################
     ### Helper Functions
     #######################################################################################################################
-
     options = ["Search by Parameters", "Search by File Name"]
-    selected_option = st.sidebar.selectbox("Select an option", options)
+    selected_option = st.selectbox("Select an option", options)
 
     if selected_option == "Search by Parameters":
         st.header("Get Hyperlinks by Parameters")
@@ -65,29 +79,45 @@ def nextrad(access_token):
         # Use Streamlit to display the dropdown for hour selection
         selected_station = col4.selectbox("Select a station:", unique_stations)
 
-        # Get the file names in the selected hour from the database through FastAPI
-        response = requests.get(
-            f"{PREFIX}/get_file_names_nexrad?year={selected_year}&month={selected_month}&day={selected_day}&station={selected_station}",
-            headers=headers,
-        ).json()
-        files = response["files"]
-        if files:
-            selected_file = st.selectbox("Please select a file to Download:", files)
-        else:
-            st.write("No files found.")
+        if st.button("Get Files"):
+            # Get the file names in the selected hour from the database through FastAPI
+            response = requests.get(
+                f"{PREFIX}/get_file_names_nexrad?year={selected_year}&month={selected_month}&day={selected_day}&station={selected_station}",
+                headers=headers,
+            ).json()
+            files = response["files"]
+            if (
+                files
+                == "Your account has reached its call limit. Please upgrade your account to continue using the service."
+            ):
+                st.warning("Please Consider Upgrading")
+            else:
+                st.session_state.nextrad_files = files
 
-        # Get the URL for the selected file from the database through FastAPI
-        response = requests.post(
-            f"{PREFIX}/get_nexrad_url",
-            data={"file_name": selected_file},
-            headers=headers,
-        ).json()
-        url = response["file_url"]
+        if st.session_state.get("nextrad_files"):
+            files = st.session_state.nextrad_files
+            if files:
+                selected_file = st.selectbox("Please select a file to Download:", files)
+            else:
+                st.write("No files found.")
 
-        # Use Streamlit to display the URL
-        st.write(f"Link to the NEXRAD S3 Bucket is \n - {url}")
-        parts = url.split("/")
-        src_file_name = "/".join(map(str, parts[3:]))
+            if st.button("Get NextRAD URL"):
+                # Get the URL for the selected file from the database through FastAPI
+                response = requests.post(
+                    f"{PREFIX}/get_nexrad_url",
+                    data={"file_name": selected_file},
+                    headers=headers,
+                ).json()
+                url = response["file_url"]
+                if (
+                    url
+                    == "Your account has reached its call limit. Please upgrade your account to continue using the service."
+                ):
+                    st.warning("Please Consider Upgrading")
+                else:
+                    # Use Streamlit to display the URL
+                    st.write(f"Link to the NEXRAD S3 Bucket is \n - {url}")
+                    st.session_state.nextrad_url = url
 
     if selected_option == "Search by File Name":
         st.header("Get Hyperlinks by Name")
@@ -103,40 +133,56 @@ def nextrad(access_token):
                     st.error(response["detail"])
                 else:
                     url = response["file_url"]
-                    st.write("File found in NEXRAD S3 bucket!")
-                    st.write(f"Link to the NEXRAD S3 Bucket is \n - {url}")
-                    parts = url.split("/")
-                    src_file_name = "/".join(map(str, parts[3:]))
+                    if (
+                        url
+                        == "Your account has reached its call limit. Please upgrade your account to continue using the service."
+                    ):
+                        st.warning("Please Consider Upgrading")
+                    else:
+                        st.write("File found in NEXRAD S3 bucket!")
+                        st.write(f"Link to the NEXRAD S3 Bucket is \n - {url}")
+                        st.session_state.nextrad_url = url
             except json.JSONDecodeError:
                 st.warning("Please enter the correct file name and format.")
         else:
             st.warning("Please enter the file name!")
 
-    copy_files = st.button("Copy Files !")
-    if copy_files:
-        logging.info("Started Logging")
-        response = requests.post(
-            f"{PREFIX}/download_and_upload_s3_file",
-            json={
-                "src_bucket": src_bucket_name,
-                "src_object": src_file_name,
-                "dest_bucket": dest_bucket_name,
-                "dest_folder": "nexrad",
-                "dest_object": selected_file,
-            },
-            headers=headers,
-        )
-        if response.status_code == 200:
-            response_json = response.json()
-            if (
-                "message" in response_json
-                and response_json["message"] == "File already present in the bucket"
-            ):
-                st.warning("File already present in the bucket.")
-                st.success(
-                    f"Here's the download link: {response_json['download_link']}"
-                )
-            else:
-                st.success(
-                    f"File uploaded successfully. Here's the download link: {response_json['download_link']}"
-                )
+    if st.session_state.get("nextrad_url"):
+        url = st.session_state.nextrad_url
+        parts = url.split("/")
+        src_file_name = "/".join(map(str, parts[3:]))
+        if st.button("Copy Files !"):
+            logging.info("Started Logging")
+            response = requests.post(
+                f"{PREFIX}/download_and_upload_s3_file",
+                json={
+                    "src_bucket": src_bucket_name,
+                    "src_object": src_file_name,
+                    "dest_bucket": dest_bucket_name,
+                    "dest_folder": "nexrad",
+                    "dest_object": selected_file,
+                },
+                headers=headers,
+            )
+            if response.status_code == 200:
+                st.session_state.nextrad_files = False
+                st.session_state.nextrad_url = False
+                response_json = response.json()
+                if (
+                    "message" in response_json
+                    and response_json["message"] == "File already present in the bucket"
+                ):
+                    st.warning("File already present in the bucket.")
+                    st.success(
+                        f"Here's the download link: {response_json['download_link']}"
+                    )
+                elif (
+                    "message" in response_json
+                    and response_json["message"]
+                    == "Your account has reached its call limit. Please upgrade your account to continue using the service."
+                ):
+                    st.warning("Please Consider Upgrading")
+                else:
+                    st.success(
+                        f"File uploaded successfully. Here's the download link: {response_json['download_link']}"
+                    )

@@ -1,6 +1,5 @@
 import io
 import os
-import sqlite3
 import time
 from datetime import datetime, timedelta
 from typing import Union
@@ -10,15 +9,18 @@ import models
 import pandas as pd
 import schema
 from botocore.exceptions import ClientError
-from database import SessionLocal, engine
+from database import get_db_session
 from fastapi import Body, Depends, FastAPI, HTTPException, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from functionsfastapi import search_file_goes, search_file_nexrad
 from gcp_bucket_connect import get_sqlite_connection
 from hashing import Hash
 from jose import JWTError, jwt
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+SessionLocal, Base, engine = get_db_session()
 models.Base.metadata.create_all(engine)
 
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
@@ -98,6 +100,26 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     return verify_token(token, credentials_exception)
 
 
+def get_username(token: str, credentials_exception):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        return username
+    except JWTError:
+        raise credentials_exception
+
+
+def get_logged_in_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    return get_username(token, credentials_exception)
+
+
 ###########################################################################################################################################
 ## User API Endpoints
 ###########################################################################################################################################
@@ -108,7 +130,14 @@ def signup(user: schema.User, db: Session = Depends(get_db)):
     )
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already exists")
-    new_user = models.User(username=user.username, password=Hash.bcrypt(user.password))
+    new_user = models.User(
+        username=user.username,
+        password=Hash.bcrypt(user.password),
+        mobile=user.mobile,
+        credit_card=Hash.bcrypt(user.credit_card),
+        service=user.service,
+        calls_remaining=user.calls_remaining,
+    )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -134,15 +163,72 @@ def signin(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@app.get("/user/{id}", response_model=schema.ShowUser, tags=["user"])
-def get_user(id: int, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.id == id).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User with the ID {id} is not available",
-        )
-    return user
+@app.put("/forget-password", tags=["user"])
+def update_password(
+    username: str,
+    password: str,
+    db: Session = Depends(get_db),
+):
+    existing_user = (
+        db.query(models.User).filter(models.User.username == username).first()
+    )
+    if existing_user:
+        hashed_password = Hash.bcrypt(password)
+        existing_user.password = hashed_password
+        db.commit()
+        return {"message": "Password updated successfully."}
+    else:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+
+@app.get("/remaining_api_calls", tags=["user"])
+def get_remaining_calls(
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
+):
+    existing_user = (
+        db.query(models.User).filter(models.User.username == current_user).first()
+    )
+    remaining_calls = existing_user.calls_remaining
+    return {"remaining_calls": remaining_calls}
+
+
+@app.put("/update_subscription", tags=["user"])
+def update_subscription(
+    service: str,
+    calls_remaining: int,
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
+):
+    # Log the activity
+    activity = models.UserActivity(
+        username=current_user,
+        request_type="PUT",
+        api_endpoint="update_subscription",
+        response_code="200",
+        description="Subscription updated",
+    )
+
+    existing_user = (
+        db.query(models.User).filter(models.User.username == current_user).first()
+    )
+    if existing_user:
+        existing_user.service = service
+        existing_user.calls_remaining = calls_remaining
+        db.commit()
+
+        # Update the description of the activity with the new subscription details
+        activity.description = f"Subscription updated: service={service}, calls_remaining={calls_remaining}"
+        db.add(activity)
+        db.commit()
+        return {"message": "Subscription Updated successfully."}
+    else:
+        activity.description = "User not found"
+        activity.response_code = "404"
+        db.add(activity)
+        db.commit()
+
+        raise HTTPException(status_code=404, detail="User not found.")
 
 
 ###########################################################################################################################################
@@ -151,9 +237,35 @@ def get_user(id: int, db: Session = Depends(get_db)):
 @app.post("/get_goes_url", status_code=200, tags=["GEOS"])
 async def get_goes_url_by_filename(
     file_name: str = Body(...),
-    get_current_user: schema.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
 ):
+    # Log the activity
+    activity = models.UserActivity(
+        username=current_user,
+        request_type="POST",
+        api_endpoint="get_goes_url",
+        response_code="200",
+        description="",
+    )
+
+    user = db.query(models.User).filter(models.User.username == current_user).first()
+    if user.calls_remaining <= 0:
+        activity.description = "Calls remaining exceeded limit"
+        activity.response_code = "403"
+        db.add(activity)
+        db.commit()
+
+        return {
+            "file_url": "Your account has reached its call limit. Please upgrade your account to continue using the service."
+        }
+
     if file_name.endswith(".gz"):
+        activity.description = "Incorrect file format"
+        activity.response_code = "400"
+        db.add(activity)
+        db.commit()
+
         raise HTTPException(
             status_code=400,
             detail="Incorrect file format (the .gz file format is not supported).",
@@ -172,8 +284,24 @@ async def get_goes_url_by_filename(
         # Generate URL for file on NOAA GOES-18 satellite AWS S3 bucket
         url = f"https://noaa-goes18.s3.amazonaws.com/ABI-L1b-RadC/{year}/{day_of_year}/{hour}/{file_name}"
         if search_file_goes(file_name, s3_client):
+            user.calls_remaining -= 1
+            db.commit()
+
+            activity.description = f"File URL: {url}"
+            db.add(activity)
+            db.commit()
+
+            activity.description = "File found in GEOS-18 S3 bucket"
+            db.add(activity)
+            db.commit()
+
             return {"file_url": url}
         else:
+            activity.description = "File not found in GEOS-18 S3 bucket"
+            activity.response_code = "404"
+            db.add(activity)
+            db.commit()
+
             raise HTTPException(
                 status_code=404, detail="File not found in the GEOS-18 S3 bucket."
             )
@@ -182,10 +310,35 @@ async def get_goes_url_by_filename(
 @app.post("/get_nexrad_url", status_code=200, tags=["NEXTRAD"])
 def get_nexrad_url_by_filename(
     file_name: str = Body(...),
-    get_current_user: schema.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
 ):
-    print(file_name)
+    # Log the activity
+    activity = models.UserActivity(
+        username=current_user,
+        request_type="POST",
+        api_endpoint="get_nexrad_url",
+        response_code="200",
+        description="",
+    )
+
+    user = db.query(models.User).filter(models.User.username == current_user).first()
+    if user.calls_remaining <= 0:
+        activity.description = "Calls remaining exceeded limit"
+        activity.response_code = "403"
+        db.add(activity)
+        db.commit()
+
+        return {
+            "file_url": "Your account has reached its call limit. Please upgrade your account to continue using the service."
+        }
+
     if file_name.endswith(".nc"):
+        activity.description = "Incorrect file format"
+        activity.response_code = "400"
+        db.add(activity)
+        db.commit()
+
         raise HTTPException(
             status_code=400,
             detail="Incorrect file format (the .nc file format is not supported).",
@@ -202,75 +355,27 @@ def get_nexrad_url_by_filename(
         # Generate URL for file on NEXRAD level 2 AWS S3 bucket
         url = f"https://noaa-nexrad-level2.s3.amazonaws.com/{year}/{month}/{day}/{station}/{file_name}"
         if search_file_nexrad(file_name, s3_client):
+            user.calls_remaining -= 1
+            db.commit()
+
+            activity.description = f"File URL: {url}"
+            db.add(activity)
+            db.commit()
+
+            activity.description = "File found in NEXRAD S3 bucket"
+            db.add(activity)
+            db.commit()
+
             return {"file_url": url}
         else:
+            activity.description = "File not found in NEXRAD S3 bucket"
+            activity.response_code = "404"
+            db.add(activity)
+            db.commit()
+
             raise HTTPException(
                 status_code=404, detail="File not found in the NEXRAD S3 bucket."
             )
-
-
-@app.post("/get_goes_url_parameters", status_code=200, tags=["GEOS"])
-def get_goes_url_by_parameters(
-    year: str = Body(...),
-    day_of_year: str = Body(...),
-    hour: str = Body(...),
-    get_current_user: schema.User = Depends(get_current_user),
-):
-    if year not in ["2022", "2023"]:
-        raise HTTPException(status_code=400, detail="Year must be 2022 or 2023")
-    if year == "2022" and not (209 <= int(day_of_year) <= 365):
-        raise HTTPException(
-            status_code=400,
-            detail="Day of year must be between 209 and 365 for year 2022",
-        )
-    if year == "2023" and not (1 <= int(day_of_year) <= 365):
-        raise HTTPException(
-            status_code=400,
-            detail="Day of year must be between 1 and 365 for year 2023",
-        )
-    if not (0 <= int(hour) <= 23):
-        raise HTTPException(status_code=400, detail="Hour must be between 00 and 23")
-
-    bucket_name = "noaa-goes18"
-    directory_path = f"ABI-L1b-RadC/{year}/{day_of_year}/{hour}/"
-    try:
-        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=directory_path)
-        files = [content["Key"] for content in response["Contents"]]
-    except KeyError:
-        # Return 404 error if directory is not found
-        raise HTTPException(status_code=404, detail="Invalid directory")
-    except ClientError:
-        # Return 500 error if there is an S3 client error
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-    # Return list of file URLs as JSON response
-    # urls = [f"https://{bucket_name}.s3.amazonaws.com/{file}" for file in files]
-    return {"file_urls": files}
-
-
-@app.post("/get_nexrad_url_parameters", status_code=200, tags=["NEXTRAD"])
-def get_nexrad_url_by_parameters(
-    year: str = Body(...),
-    month: str = Body(...),
-    day: str = Body(...),
-    Station: str = Body(...),
-    get_current_user: schema.User = Depends(get_current_user),
-):
-    bucket_name = "noaa-nexrad-level2"
-    directory_path = f"{year}/{month}/{day}/{Station}/"
-    try:
-        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=directory_path)
-        files = [content["Key"] for content in response["Contents"]]
-    except KeyError:
-        # Return 404 error if directory is not found
-        raise HTTPException(status_code=404, detail="Invalid Directory")
-    except ClientError:
-        # Return 500 error if there is an S3 client error
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-    # Return list of file URLs as JSON response
-    urls = [f"https://{bucket_name}.s3.amazonaws.com/{file}" for file in files]
-    return {"file_urls": urls}
 
 
 @app.get("/get_unique_years_geos", status_code=200, tags=["GEOS"])
@@ -333,8 +438,28 @@ async def get_file_names(
     year: str,
     day: str,
     hour: str,
-    get_current_user: schema.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
 ):
+    # Log the activity
+    activity = models.UserActivity(
+        username=current_user,
+        request_type="GET",
+        api_endpoint="get_file_names_geos",
+        response_code="200",
+        description="",
+    )
+
+    user = db.query(models.User).filter(models.User.username == current_user).first()
+    if user.calls_remaining <= 0:
+        activity.description = "Calls remaining exceeded limit"
+        activity.response_code = "403"
+        db.add(activity)
+        db.commit()
+
+        return {
+            "files": "Your account has reached its call limit. Please upgrade your account to continue using the service."
+        }
     bucket_name = "noaa-goes18"
     directory_path = f"ABI-L1b-RadC/{year}/{day}/{hour}/"
     try:
@@ -344,10 +469,29 @@ async def get_file_names(
         ]
     except KeyError:
         # Return 404 error if directory is not found
+        activity.description = "Invalid directory"
+        activity.response_code = "404"
+        db.add(activity)
+        db.commit()
+
         raise HTTPException(status_code=404, detail="Invalid directory")
     except ClientError:
         # Return 500 error if there is an S3 client error
+        activity.description = "Internal server error"
+        activity.response_code = "500"
+        db.add(activity)
+        db.commit()
+
         raise HTTPException(status_code=500, detail="Internal server error")
+
+    # Decrement the calls_remaining column in the database for the current user
+    user.calls_remaining -= 1
+    db.commit()
+
+    activity.description = f"Number of files: {len(files)}"
+    db.add(activity)
+    db.commit()
+
     return {"files": files}
 
 
@@ -419,8 +563,28 @@ async def get_file_names(
     month: str,
     day: str,
     station: str,
-    get_current_user: schema.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
 ):
+    # Log the activity
+    activity = models.UserActivity(
+        username=current_user,
+        request_type="GET",
+        api_endpoint="get_file_names_nexrad",
+        response_code="200",
+        description="",
+    )
+
+    user = db.query(models.User).filter(models.User.username == current_user).first()
+    if user.calls_remaining <= 0:
+        activity.description = "Calls remaining exceeded limit"
+        activity.response_code = "403"
+        db.add(activity)
+        db.commit()
+
+        return {
+            "files": "Your account has reached its call limit. Please upgrade your account to continue using the service."
+        }
     bucket_name = "noaa-nexrad-level2"
     directory_path = f"{year}/{month}/{day}/{station}/"
     try:
@@ -430,10 +594,28 @@ async def get_file_names(
         ]
     except KeyError:
         # Return 404 error if directory is not found
+        activity.description = "Invalid directory"
+        activity.response_code = "404"
+        db.add(activity)
+        db.commit()
+
         raise HTTPException(status_code=404, detail="Invalid directory")
     except ClientError:
         # Return 500 error if there is an S3 client error
+        activity.description = "Internal server error"
+        activity.response_code = "500"
+        db.add(activity)
+        db.commit()
+
         raise HTTPException(status_code=500, detail="Internal server error")
+
+    user.calls_remaining -= 1
+    db.commit()
+
+    activity.description = f"Number of files: {len(files)}"
+    db.add(activity)
+    db.commit()
+
     return {"files": files}
 
 
@@ -444,14 +626,41 @@ async def download_and_upload_s3_file(
     dest_bucket: str = Body(...),
     dest_folder: str = Body(...),
     dest_object: str = Body(...),
-    get_current_user: schema.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
 ):
+    # Log the activity
+    activity = models.UserActivity(
+        username=current_user,
+        request_type="POST",
+        api_endpoint="download_and_upload_s3_file",
+        response_code="200",
+        description="",
+    )
+
+    user = db.query(models.User).filter(models.User.username == current_user).first()
+    if user.calls_remaining <= 0:
+        activity.description = "Calls remaining exceeded limit"
+        activity.response_code = "403"
+        db.add(activity)
+        db.commit()
+
+        return {
+            "message": "Your account has reached its call limit. Please upgrade your account to continue using the service."
+        }
+
     # Check if the file already exists in the destination bucket
     dest_path = dest_folder + "/" + dest_object
     try:
         s3_client.head_object(Bucket=dest_bucket, Key=dest_path)
         url = await get_object_url(dest_bucket, dest_path)
         user_s3_download_link = url["url"].split("?")[0]
+
+        activity.description = "File already present in the bucket"
+        activity.response_code = "200"
+        db.add(activity)
+        db.commit()
+
         return {
             "message": "File already present in the bucket",
             "download_link": user_s3_download_link,
@@ -479,6 +688,15 @@ async def download_and_upload_s3_file(
     write_logs(f"uploading completed", s3_client_logs)
     url = await get_object_url(dest_bucket, dest_path)
     user_s3_download_link = url["url"].split("?")[0]
+
+    # Decrement the calls_remaining column in the database for the current user
+    user.calls_remaining -= 1
+    db.commit()
+
+    activity.description = f"File uploaded to {dest_bucket} at {dest_path}"
+    db.add(activity)
+    db.commit()
+
     return {"download_link": user_s3_download_link}
 
 
@@ -515,16 +733,53 @@ async def get_object_url(
 
 @app.get("/nexrad_stations", status_code=200, tags=["NEXTRAD"])
 async def get_nexrad_stations(
-    get_current_user: schema.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
 ):
     try:
         df = pd.read_csv("nexrad-stations.csv")
         df = df.fillna(0)
-        return df.to_dict("records")
+        user = (
+            db.query(models.User).filter(models.User.username == current_user).first()
+        )
+        if user.calls_remaining <= 0:
+            return {
+                "message": "Your account has reached its call limit. Please upgrade your account to continue using the service."
+            }
+        else:
+            user.calls_remaining -= 1
+            db.commit()
+            return df.to_dict("records")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+################################################################################################################
+## Analytics API
+################################################################################################################
+@app.get("/user_activity")
+async def get_user_activity(
+    db: Session = Depends(get_db),
+    current_user: schema.User = Depends(get_logged_in_user),
+):
+    # retrieve all user activity records
+    if current_user == "damg7245":
+        query = db.query(models.UserActivity).all()
+    else:
+        # if the current user is not an admin, filter by username
+        query = (
+            db.query(models.UserActivity)
+            .filter(models.UserActivity.username == current_user)
+            .all()
+        )
+    # return data as JSON
+    data = jsonable_encoder(query)
+    return data
+
+
+################################################################################################################
+## DB Shutdown on Event
+################################################################################################################
 @app.on_event("shutdown")
 async def close_db_connection():
     conn.close()
