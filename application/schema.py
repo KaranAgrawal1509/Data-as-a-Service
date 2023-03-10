@@ -1,12 +1,17 @@
+from datetime import datetime
 from typing import Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class User(BaseModel):
     id: Optional[int]
     username: str
     password: str
+    mobile: str
+    credit_card: str
+    service: str
+    calls_remaining: int
 
 
 class ShowUser(BaseModel):

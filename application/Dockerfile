@@ -12,8 +12,6 @@ ADD functionsfastapi.py /app/
 
 ADD nexrad-stations.csv /app/
 
-ADD users.db /app/
-
 EXPOSE 8000
 # Expose a port inside the container on which services run
 
